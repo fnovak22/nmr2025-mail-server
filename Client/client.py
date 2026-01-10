@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 from tkinter.scrolledtext import ScrolledText
+from PIL import Image, ImageTk
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -172,6 +173,24 @@ class MailClientGUI:
         self.current_mails = []
         self.current_username = self.username
 
+        self.loader_label = ttk.Label(top)
+        self.loader_label.pack(side='left', padx=8)
+        self.loader_label.pack_forget()
+
+        self.loader_gif = Image.open("loader.gif")
+        self.loader_frames = []
+        desired_size = (24, 24)  # Set your desired width and height here
+        try:
+            while True:
+                frame = self.loader_gif.copy().resize(desired_size, Image.LANCZOS)
+                self.loader_frames.append(ImageTk.PhotoImage(frame))
+                self.loader_gif.seek(len(self.loader_frames))
+        except EOFError:
+            pass
+        self.loader_gif.seek(0)
+        self.loader_frame_index = 0
+        self.loader_animating = False
+
     def logout(self):
         if not messagebox.askyesno("Logout", "Are you sure you want to logout?"):
             return
@@ -200,6 +219,23 @@ class MailClientGUI:
             MailClientGUI(self.root, username, session)
             return
 
+    def show_loader(self):
+        self.loader_label.pack(side='left', padx=8)
+        self.loader_animating = True
+        self.animate_loader()
+
+    def hide_loader(self):
+        self.loader_animating = False
+        self.loader_label.pack_forget()
+
+    def animate_loader(self):
+        if not self.loader_animating:
+            return
+        frame = self.loader_frames[self.loader_frame_index]
+        self.loader_label.config(image=frame)
+        self.loader_frame_index = (self.loader_frame_index + 1) % len(self.loader_frames)
+        self.root.after(80, self.animate_loader) 
+
     def delete_selected_mail(self):
         if not self.selected_ids:
             messagebox.showinfo("Delete", "No messages selected.")
@@ -212,6 +248,7 @@ class MailClientGUI:
         self.content_box.delete('1.0', tk.END)
 
     def fetch_mail(self):
+        self.show_loader()
         threading.Thread(target=self._fetch_mail_worker, daemon=True).start()
 
     def _fetch_mail_worker(self):
@@ -248,8 +285,9 @@ class MailClientGUI:
                     pass
                 save_local_mails(self.username, local)
                 self.root.after(0, lambda: self.load_mails_into_tree(self.username, local))
-                messagebox.showinfo("Fetched", f"Fetched {len(normalized)} messages. Local total: {len(local)}")
+                self.root.after(600, self.hide_loader)
         except Exception as e:
+            self.root.after(600, self.hide_loader)
             messagebox.showerror("Error", f"Fetch failed: {e}")
 
     def load_mails_into_tree(self, username, mail_list):
