@@ -117,6 +117,13 @@ def normalize_incoming(m):
         'read': False
     }
 
+def format_timestamp(ts):
+    try:
+        dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+        return dt.strftime('%d.%m.%Y. %H:%M')
+    except Exception:
+        return ts
+
 class MailClientGUI:
     def __init__(self, root, username, session_token):
         self.root = root
@@ -317,7 +324,7 @@ class MailClientGUI:
             read_flag = '✓' if m.get('read') else ''
             subj = m.get('subject') or '(no subject)'
             frm = m.get('from') or ''
-            ts = m.get('timestamp') or ''
+            ts = format_timestamp(m.get('timestamp') or '')
             self.tree.insert('', 'end', iid=m['id'], values=('\u2610', subj, frm, ts, read_flag))
         self.content_box.delete('1.0', tk.END)
 
@@ -334,7 +341,7 @@ class MailClientGUI:
             self.tree.set(mid, 'read', '✓')
             save_local_mails(self.current_username, self.current_mails)
         self.content_box.delete('1.0', tk.END)
-        display = f"From: {m.get('from')}\nSubject: {m.get('subject')}\nTime: {m.get('timestamp')}\n\n{m.get('content')}"
+        display = f"From: {m.get('from')}\nSubject: {m.get('subject')}\nTime: {format_timestamp(m.get('timestamp'))}\n\n{m.get('content')}"
         self.content_box.insert(tk.END, display)
 
     def on_tree_click(self, event):
