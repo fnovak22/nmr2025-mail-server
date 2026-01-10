@@ -8,6 +8,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import errno
 
 HOST = '127.0.0.1'
 PORT = 50001
@@ -321,8 +322,11 @@ class MailClientGUI:
         self.send_subject.delete(0, tk.END)
         self.send_content.delete('1.0', tk.END)
 
-# ---------- Login helper ----------
 def attempt_login(username, password):
+    """
+    Pokušaj login-a. Za probleme s konekcijom vraća čistu poruku
+    'Login error: Cant connect to server' umjesto sirovog WinError/OS poruke.
+    """
     try:
         with socket.create_connection((HOST, PORT), timeout=5) as sock:
             aesgcm = perform_handshake_and_get_aes(sock)
@@ -332,36 +336,28 @@ def attempt_login(username, password):
 
             plain = aesgcm_recv_decrypt(aesgcm, sock)
             if plain is None:
-                return False, "No response"
+                return False, "No response from server"
 
             data = json.loads(plain.decode())
             if data.get('status') == 'ok':
                 return True, data.get('session')
             else:
                 return False, data.get('error', 'auth failed')
+    except (socket.timeout, ConnectionRefusedError, socket.gaierror):
+        # timeout, odbijena konekcija, nepoznata adresa -> korisniku samo čista poruka
+        return False, "Login error: Cant connect to server"
+    except OSError as e:
+        # provjeri errno za poznate mrežne/konkretne connection greške
+        if getattr(e, 'errno', None) in (
+            errno.ECONNREFUSED, errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ECONNRESET
+        ):
+            return False, "Login error: Cant connect to server"
+        # za druge OS greške možeš vratiti neutralniju poruku
+        return False, "Login error: Unable to login"
     except Exception as e:
-        return False, str(e)
-
-# ---------- Login helper ----------
-def attempt_login(username, password):
-    try:
-        with socket.create_connection((HOST, PORT), timeout=5) as sock:
-            aesgcm = perform_handshake_and_get_aes(sock)
-            payload = json.dumps({'type':'login','username':username,'password':password}).encode()
-
-            aesgcm_encrypt_send(aesgcm, sock, payload)
-
-            plain = aesgcm_recv_decrypt(aesgcm, sock)
-            if plain is None:
-                return False, "No response"
-
-            data = json.loads(plain.decode())
-            if data.get('status') == 'ok':
-                return True, data.get('session')
-            else:
-                return False, data.get('error', 'auth failed')
-    except Exception as e:
-        return False, str(e)
+        # neočekivane greške: logiraj u konzolu ali ne pokazuj korisniku sirove greške
+        print("Unexpected login error:", repr(e))
+        return False, "Login error: Unable to login"
 
 # ---------- Robust Login dialog with status label ----------
 class LoginDialog(tk.Toplevel):
