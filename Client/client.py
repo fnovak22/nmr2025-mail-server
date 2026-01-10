@@ -1,8 +1,9 @@
 import socket, struct, json, os, threading, hashlib
 from datetime import datetime, timezone
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox
 from tkinter.scrolledtext import ScrolledText
+from PIL import Image, ImageTk
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -17,7 +18,6 @@ BASE_DIR = os.path.dirname(__file__)
 MAILS_DIR = os.path.join(BASE_DIR, "mails")
 os.makedirs(MAILS_DIR, exist_ok=True)
 
-# prikupi n bajtova sa socketa, jer je to STREAM (TCP) , nije UDP datagram koji ima svoj size
 def recv_all_bytes_size(sock, n):
     data = b''
     while len(data) < n:
@@ -41,9 +41,9 @@ def aesgcm_encrypt_send(aesgcm: AESGCM, sock, data: bytes):
     """
     Automatski generira nonce, šifrira data i pošalje preko sock
     """
-    nonce = os.urandom(12)                   # generiraj 12-bajtni nonce
+    nonce = os.urandom(12)
     ciphertext = aesgcm.encrypt(nonce, data, None)
-    send_message_with_packed_length(sock, nonce + ciphertext)   # šalje nonce + ciphertext
+    send_message_with_packed_length(sock, nonce + ciphertext)
 
 def aesgcm_recv_decrypt(aesgcm: AESGCM, sock):
     packed = recv_message_full_length(sock)
@@ -53,7 +53,6 @@ def aesgcm_recv_decrypt(aesgcm: AESGCM, sock):
     cyphertext_tag = packed[12:]
     return aesgcm.decrypt(nonce_server, cyphertext_tag, None)
 
-# Ephemeral per-connection handshake (forward secrecy)
 def perform_handshake_and_get_aes(sock):
     server_pub_bytes = recv_all_bytes_size(sock, 32)
     if not server_pub_bytes:
@@ -65,7 +64,7 @@ def perform_handshake_and_get_aes(sock):
     )
     sock.sendall(client_pub_bytes)
     server_pub = X25519PublicKey.from_public_bytes(server_pub_bytes)
-    shared = client_priv.exchange(server_pub) #shared = server_pub ^ client_priv
+    shared = client_priv.exchange(server_pub)
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
         length=32,
@@ -75,7 +74,6 @@ def perform_handshake_and_get_aes(sock):
     aes_key = hkdf.derive(shared)
     return AESGCM(aes_key)
 
-# ---------- Local mail storage helpers ----------
 def user_mailfile(username):
     return os.path.join(MAILS_DIR, f"{username}.json")
 
@@ -119,7 +117,13 @@ def normalize_incoming(m):
         'read': False
     }
 
-# ---------- GUI ----------
+def format_timestamp(ts):
+    try:
+        dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+        return dt.strftime('%d.%m.%Y. %H:%M')
+    except Exception:
+        return ts
+
 class MailClientGUI:
     def __init__(self, root, username, session_token):
         self.root = root
@@ -128,16 +132,15 @@ class MailClientGUI:
 
         root.title(f"Mail Client - {self.username}")
         self.notebook = ttk.Notebook(root)
+        self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_changed)
         self.notebook.pack(fill='both', expand=True, padx=6, pady=6)
 
         self.build_inbox_tab()
         self.build_send_tab()
 
-        # load local mails at startup
         local = load_local_mails(self.username)
         self.load_mails_into_tree(self.username, local)
 
-    # ----- Inbox Tab -----
     def build_inbox_tab(self):
         frame = ttk.Frame(self.notebook)
         self.notebook.add(frame, text="Inbox")
@@ -146,24 +149,32 @@ class MailClientGUI:
         top.pack(fill='x', padx=6, pady=6)
         ttk.Label(top, text=f"Logged in as: {self.username}").pack(side='left')
         ttk.Button(top, text="Fetch mail", command=self.fetch_mail).pack(side='left', padx=8)
+        ttk.Button(top, text="Mark as Unread", command=self.mark_as_unread).pack(side='left', padx=8)
+        ttk.Button(top, text="Delete", command=self.delete_selected_mail).pack(side='left', padx=8)
+        self.status_label = ttk.Label(top, text="", foreground="red")
+        self.status_label.pack(side='left', padx=8)
+        self.status_label.pack_forget()
         ttk.Button(top, text="Logout", command=self.logout).pack(side='right')
 
         mid = ttk.Frame(frame)
         mid.pack(fill='both', expand=True, padx=6, pady=6)
 
-        cols = ('subject', 'from', 'timestamp', 'read')
-        self.tree = ttk.Treeview(mid, columns=cols, show='headings', selectmode='browse')
+        cols = ('select', 'subject', 'from', 'timestamp', 'read')
+        self.tree = ttk.Treeview(mid, columns=cols, show='headings', selectmode='extended')
+        self.tree.heading('select', text='')
         self.tree.heading('subject', text='Subject')
         self.tree.heading('from', text='From')
         self.tree.heading('timestamp', text='Timestamp')
         self.tree.heading('read', text='Read')
+        self.tree.column('select', width=30, anchor='center')
         self.tree.column('subject', width=200)
         self.tree.column('from', width=100)
         self.tree.column('timestamp', width=160)
         self.tree.column('read', width=50, anchor='center')
         self.tree.pack(side='left', fill='both', expand=True)
 
-        self.tree.bind("<Double-1>", self.on_tree_double)
+        self.tree.bind("<Button-1>", self.on_tree_click)
+        self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
 
         right = ttk.Frame(mid)
         right.pack(side='right', fill='both', expand=True)
@@ -174,22 +185,36 @@ class MailClientGUI:
         self.current_mails = []
         self.current_username = self.username
 
+        self.loader_label = ttk.Label(top)
+        self.loader_label.pack(side='left', padx=8)
+        self.loader_label.pack_forget()
+
+        self.loader_gif = Image.open("loader.gif")
+        self.loader_frames = []
+        desired_size = (24, 24)
+        try:
+            while True:
+                frame = self.loader_gif.copy().resize(desired_size, Image.LANCZOS)
+                self.loader_frames.append(ImageTk.PhotoImage(frame))
+                self.loader_gif.seek(len(self.loader_frames))
+        except EOFError:
+            pass
+        self.loader_gif.seek(0)
+        self.loader_frame_index = 0
+        self.loader_animating = False
+
     def logout(self):
         if not messagebox.askyesno("Logout", "Are you sure you want to logout?"):
             return
 
-        # zatvori GUI
         self.root.withdraw()
 
-        # očisti state (nije strogo nužno, ali je uredno)
         self.username = None
         self.session = None
 
-        # pokreni login ponovo
         self.root.after(0, self._show_login_again)
 
     def _show_login_again(self):
-        # ukloni stari UI
         for w in self.root.winfo_children():
             w.destroy()
 
@@ -198,7 +223,6 @@ class MailClientGUI:
             self.root.wait_window(login)
 
             if not login.result:
-                # korisnik cancel → zatvori app
                 self.root.destroy()
                 return
 
@@ -207,12 +231,68 @@ class MailClientGUI:
             MailClientGUI(self.root, username, session)
             return
 
+    def on_tab_changed(self, event):
+        self.status_label.pack_forget()
+        
+        for mid in list(getattr(self, 'selected_ids', [])):
+            self.tree.set(mid, 'select', '\u2610')
+        self.selected_ids.clear()
+        
+        self.content_box.delete('1.0', tk.END)
+
+        self.tree.selection_remove(self.tree.selection())
+
+    def show_loader(self):
+        self.loader_label.pack(side='left', padx=8)
+        self.loader_animating = True
+        self.animate_loader()
+
+    def hide_loader(self):
+        self.loader_animating = False
+        self.loader_label.pack_forget()
+
+    def animate_loader(self):
+        if not self.loader_animating:
+            return
+        frame = self.loader_frames[self.loader_frame_index]
+        self.loader_label.config(image=frame)
+        self.loader_frame_index = (self.loader_frame_index + 1) % len(self.loader_frames)
+        self.root.after(80, self.animate_loader) 
+
+    def delete_selected_mail(self):
+        if not self.selected_ids:
+            self.status_label.config(text="No messages selected.")
+            self.status_label.pack(side='left', padx=8)
+            return
+        self.current_mails = [m for m in self.current_mails if m['id'] not in self.selected_ids]
+        save_local_mails(self.current_username, self.current_mails)
+        self.load_mails_into_tree(self.current_username, self.current_mails)
+        self.content_box.delete('1.0', tk.END)
+
+    def mark_as_unread(self):
+        if not self.selected_ids:
+            self.status_label.config(text="No messages selected.")
+            self.status_label.pack(side='left', padx=8)
+            return
+        changed = False
+        for mid in self.selected_ids:
+            m = next((x for x in self.current_mails if x['id'] == mid), None)
+            if m and m.get('read'):
+                m['read'] = False
+                self.tree.set(mid, 'read', '')
+                changed = True
+        if changed:
+            save_local_mails(self.current_username, self.current_mails)
+        for mid in list(self.selected_ids):
+            self.tree.set(mid, 'select', '\u2610')
+        self.selected_ids.clear()
+
     def fetch_mail(self):
+        self.show_loader()
         threading.Thread(target=self._fetch_mail_worker, daemon=True).start()
 
     def _fetch_mail_worker(self):
         try:
-            #SOCK STREAM = TCP
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(5)
                 sock.connect((HOST, PORT))
@@ -245,23 +325,26 @@ class MailClientGUI:
                     pass
                 save_local_mails(self.username, local)
                 self.root.after(0, lambda: self.load_mails_into_tree(self.username, local))
-                messagebox.showinfo("Fetched", f"Fetched {len(normalized)} messages. Local total: {len(local)}")
+                self.root.after(600, self.hide_loader)
         except Exception as e:
+            self.root.after(600, self.hide_loader)
             messagebox.showerror("Error", f"Fetch failed: {e}")
 
     def load_mails_into_tree(self, username, mail_list):
         self.tree.delete(*self.tree.get_children())
         self.current_mails = mail_list
         self.current_username = username
+        self.selected_ids = set()
         for m in mail_list:
             read_flag = '✓' if m.get('read') else ''
             subj = m.get('subject') or '(no subject)'
             frm = m.get('from') or ''
-            ts = m.get('timestamp') or ''
-            self.tree.insert('', 'end', iid=m['id'], values=(subj, frm, ts, read_flag))
+            ts = format_timestamp(m.get('timestamp') or '')
+            self.tree.insert('', 'end', iid=m['id'], values=('\u2610', subj, frm, ts, read_flag))
         self.content_box.delete('1.0', tk.END)
 
-    def on_tree_double(self, event):
+    def on_tree_select(self, event):
+        self.status_label.pack_forget()
         sel = self.tree.selection()
         if not sel:
             return
@@ -269,41 +352,62 @@ class MailClientGUI:
         m = next((x for x in self.current_mails if x['id'] == mid), None)
         if not m:
             return
-        m['read'] = not bool(m.get('read'))
-        read_flag = '✓' if m['read'] else ''
-        self.tree.set(mid, 'read', read_flag)
+        if not m.get('read'):
+            m['read'] = True
+            self.tree.set(mid, 'read', '✓')
+            save_local_mails(self.current_username, self.current_mails)
         self.content_box.delete('1.0', tk.END)
-        display = f"From: {m.get('from')}\nSubject: {m.get('subject')}\nTime: {m.get('timestamp')}\n\n{m.get('content')}"
+        display = f"From: {m.get('from')}\nSubject: {m.get('subject')}\nTime: {format_timestamp(m.get('timestamp'))}\n\n{m.get('content')}"
         self.content_box.insert(tk.END, display)
-        save_local_mails(self.current_username, self.current_mails)
 
-    # ----- Send Tab -----
+    def on_tree_click(self, event):
+        self.status_label.pack_forget()
+        region = self.tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        col = self.tree.identify_column(event.x)
+        if col != "#1":
+            return
+        row_id = self.tree.identify_row(event.y)
+        if not row_id:
+            return
+        if row_id in self.selected_ids:
+            self.selected_ids.remove(row_id)
+            self.tree.set(row_id, 'select', '\u2610')
+        else:
+            self.selected_ids.add(row_id)
+            self.tree.set(row_id, 'select', '\u2611')
+
     def build_send_tab(self):
         frame = ttk.Frame(self.notebook)
         self.notebook.add(frame, text="Send")
 
         frm = ttk.Frame(frame)
-        frm.pack(fill='x', padx=6, pady=6)
+        frm.pack(fill='both', expand=True, padx=6, pady=6)
+
         ttk.Label(frm, text="From:").grid(row=0, column=0, sticky='w')
-        self.send_from = ttk.Entry(frm, width=30)
-        self.send_from.grid(row=0, column=1, padx=6, pady=4)
+        self.send_from = ttk.Entry(frm)
+        self.send_from.grid(row=0, column=1, sticky='ew', padx=6, pady=4)
         self.send_from.insert(0, self.username)
         self.send_from.config(state='disabled')
 
         ttk.Label(frm, text="To:").grid(row=1, column=0, sticky='w')
-        self.send_to = ttk.Entry(frm, width=30)
-        self.send_to.grid(row=1, column=1, padx=6, pady=4)
+        self.send_to = ttk.Entry(frm)
+        self.send_to.grid(row=1, column=1, sticky='ew', padx=6, pady=4)
 
         ttk.Label(frm, text="Subject:").grid(row=2, column=0, sticky='w')
-        self.send_subject = ttk.Entry(frm, width=50)
-        self.send_subject.grid(row=2, column=1, padx=6, pady=4)
+        self.send_subject = ttk.Entry(frm)
+        self.send_subject.grid(row=2, column=1, sticky='ew', padx=6, pady=4)
 
         ttk.Label(frm, text="Content:").grid(row=3, column=0, sticky='nw')
-        self.send_content = ScrolledText(frm, width=60, height=10)
-        self.send_content.grid(row=3, column=1, padx=6, pady=4)
+        self.send_content = ScrolledText(frm)
+        self.send_content.grid(row=3, column=1, sticky='nsew', padx=6, pady=4)
 
         btn = ttk.Button(frm, text="Send", command=self.do_send)
         btn.grid(row=4, column=1, sticky='e', pady=6)
+
+        frm.columnconfigure(1, weight=1)
+        frm.rowconfigure(3, weight=1)
 
     def do_send(self):
         frm = self.username
@@ -342,7 +446,6 @@ class MailClientGUI:
                 resp = json.loads(plain.decode())
                 if resp.get('status') == 'ok':
                     self.root.after(0, lambda: self.clear_send_fields())
-                    messagebox.showinfo("Sent", "Message sent successfully.")
                     return
                 else:
                     messagebox.showerror("Error", f"Send failed: {resp.get('error')}")
@@ -378,25 +481,19 @@ def attempt_login(username, password):
             else:
                 return False, data.get('error', 'auth failed')
     except (socket.timeout, ConnectionRefusedError, socket.gaierror):
-        # timeout, odbijena konekcija, nepoznata adresa -> korisniku samo čista poruka
         return False, "Login error: Cant connect to server"
     except OSError as e:
-        # provjeri errno za poznate mrežne/konkretne connection greške
         if getattr(e, 'errno', None) in (
             errno.ECONNREFUSED, errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ECONNRESET
         ):
             return False, "Login error: Cant connect to server"
-        # za druge OS greške možeš vratiti neutralniju poruku
         return False, "Login error: Unable to login"
     except Exception as e:
-        # neočekivane greške: logiraj u konzolu ali ne pokazuj korisniku sirove greške
         print("Unexpected login error:", repr(e))
         return False, "Login error: Unable to login"
-
-# ---------- Robust Login dialog with status label ----------
+    
 class LoginDialog(tk.Toplevel):
     def __init__(self, parent):
-        # Napravi Toplevel; nemoj se oslanjati potpuno na parent ako je withdrawn
         super().__init__(parent)
         self.parent = parent
         self.result = None
@@ -404,25 +501,19 @@ class LoginDialog(tk.Toplevel):
         self.title("Login")
         self.resizable(False, False)
 
-        # state
         self._logging = False
-        # worker will write (ok, result, username) here; polled by main thread
         self._login_response = None
 
-        # Modal behavior
         try:
-            # Ako parent nije mapiran/vidljiv, nemoj postavljati transient (neke platforme skrivaju u tom slučaju)
             if getattr(self.parent, 'winfo_ismapped', None) and self.parent.winfo_ismapped():
                 self.transient(self.parent)
         except Exception:
             pass
 
-        # Ensure dialog is visible and above other windows
         self.deiconify()
         self.lift()
         try:
             self.attributes("-topmost", True)
-            # remove topmost shortly after so it doesn't stay always-on-top
             self.after(100, lambda: self.attributes("-topmost", False))
         except Exception:
             pass
@@ -445,20 +536,17 @@ class LoginDialog(tk.Toplevel):
         self.cancel_btn = ttk.Button(btn_frame, text="Cancel", command=self.on_cancel)
         self.cancel_btn.pack(side='right')
 
-        # status label below buttons
         self.status_label = ttk.Label(frm, text="", anchor='w')
         self.status_label.grid(row=4, column=0, columnspan=2, sticky='we', pady=(8,0))
 
         self.bind("<Return>", lambda e: self.on_ok())
         self.bind("<Escape>", lambda e: self.on_cancel())
 
-        # Modal grab so user must interact with this dialog
         try:
             self.grab_set()
         except Exception:
             pass
 
-        # Focus and center
         self.ent_user.focus_set()
         self.update_idletasks()
         self.center_over_parent()
@@ -481,7 +569,6 @@ class LoginDialog(tk.Toplevel):
                 x = max(0, (sw - w) // 2)
                 y = max(0, (sh - h) // 2)
             self.geometry(f"+{x}+{y}")
-            # Ensure visible and raised
             self.deiconify()
             self.lift()
         except Exception:
@@ -502,22 +589,17 @@ class LoginDialog(tk.Toplevel):
             self.set_status("Please enter username and password")
             return
 
-        # disable controls while logging in
         self._set_controls_state('disabled')
         self._logging = True
         self.set_status("Logging in...")
 
-        # clear any previous response
         self._login_response = None
 
-        # start background login (worker will only set self._login_response)
         threading.Thread(target=self._login_worker, args=(username, password), daemon=True).start()
 
-        # start polling from the main thread for worker's result
         self.after(100, self._poll_login_response)
 
     def on_cancel(self):
-        # if currently logging, prevent cancel to avoid race conditions; user can close window after failure
         if self._logging:
             return
         self.result = None
@@ -532,8 +614,6 @@ class LoginDialog(tk.Toplevel):
             ok, result = attempt_login(username, password)
         except Exception as e:
             ok, result = False, str(e)
-        # do NOT call tkinter methods from this thread
-        # instead store the result in a variable the main thread will check
         self._login_response = (ok, result, username)
 
     def _poll_login_response(self):
@@ -541,22 +621,18 @@ class LoginDialog(tk.Toplevel):
         Called on the main thread via after(): checks whether worker filled
         self._login_response. If not, schedule another check.
         """
-        # If dialog was destroyed meanwhile, stop polling
         if not getattr(self, 'winfo_exists', lambda: True)():
             return
 
         if self._login_response is None:
-            # keep polling until worker sets the response
             self.after(100, self._poll_login_response)
             return
 
-        # we have a response; grab it and handle it on the main thread
         ok, result, username = self._login_response
         self._login_response = None
         self._logging = False
 
         if ok:
-            # successful login -> set result to (username, session_token) and close dialog
             self.result = (username, result)
             try:
                 self.grab_release()
@@ -565,7 +641,6 @@ class LoginDialog(tk.Toplevel):
             self.destroy()
             return
         else:
-            # show error in status label and re-enable controls
             self.set_status(f"Login failed: {result}", is_error=True)
             self._set_controls_state('normal')
             self.ent_pwd.focus_set()
@@ -608,7 +683,6 @@ class LoginDialog(tk.Toplevel):
             if is_error:
                 self.status_label.config(text=text, foreground='red')
             else:
-                # normal / info state
                 self.status_label.config(text=text, foreground='black')
         except Exception:
             pass
@@ -623,18 +697,16 @@ def main():
     except Exception:
         pass
 
-    root.withdraw()  # keep main window hidden until successful login
+    root.withdraw()
 
     while True:
         login = LoginDialog(root)
-        root.wait_window(login)  # modal wait
+        root.wait_window(login)
 
         if not login.result:
-            # user cancelled -> exit
             return
 
         username, session = login.result
-        # successful login -> show main window
         root.deiconify()
         break
 
