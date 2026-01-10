@@ -342,23 +342,138 @@ def attempt_login(username, password):
     except Exception as e:
         return False, str(e)
 
+# ---------- Robust Login dialog (works when root.withdraw() is set) ----------
+class LoginDialog(tk.Toplevel):
+    def __init__(self, parent):
+        # Napravi Toplevel; nemoj se oslanjati potpuno na parent ako je withdrawn
+        super().__init__(parent)
+        self.parent = parent
+        self.result = None
+
+        self.title("Login")
+        self.resizable(False, False)
+
+        # Modal behavior
+        try:
+            # Ako parent nije mapiran/vidljiv, nemoj postavljati transient (neke platforme skrivaju u tom slučaju)
+            if getattr(self.parent, 'winfo_ismapped', None) and self.parent.winfo_ismapped():
+                self.transient(self.parent)
+        except Exception:
+            pass
+
+        # Ensure dialog is visible and above other windows
+        self.deiconify()
+        self.lift()
+        try:
+            self.attributes("-topmost", True)
+            # remove topmost shortly after so it doesn't stay always-on-top
+            self.after(100, lambda: self.attributes("-topmost", False))
+        except Exception:
+            pass
+
+        frm = ttk.Frame(self, padding=12)
+        frm.pack(fill='both', expand=True)
+
+        ttk.Label(frm, text="Username:").grid(row=0, column=0, sticky='w', pady=(0,6))
+        self.ent_user = ttk.Entry(frm, width=30)
+        self.ent_user.grid(row=0, column=1, pady=(0,6))
+
+        ttk.Label(frm, text="Password:").grid(row=1, column=0, sticky='w', pady=(0,6))
+        self.ent_pwd = ttk.Entry(frm, width=30, show='*')
+        self.ent_pwd.grid(row=1, column=1, pady=(0,6))
+
+        btn_frame = ttk.Frame(frm)
+        btn_frame.grid(row=2, column=0, columnspan=2, pady=(8,0), sticky='e')
+        ok_btn = ttk.Button(btn_frame, text="OK", command=self.on_ok)
+        ok_btn.pack(side='right', padx=(0,6))
+        cancel_btn = ttk.Button(btn_frame, text="Cancel", command=self.on_cancel)
+        cancel_btn.pack(side='right')
+
+        self.bind("<Return>", lambda e: self.on_ok())
+        self.bind("<Escape>", lambda e: self.on_cancel())
+
+        # Modal grab so user must interact with this dialog
+        try:
+            self.grab_set()
+        except Exception:
+            pass
+
+        # Focus and center
+        self.ent_user.focus_set()
+        self.update_idletasks()
+        self.center_over_parent()
+
+    def center_over_parent(self):
+        self.update_idletasks()
+        w = self.winfo_width()
+        h = self.winfo_height()
+        try:
+            if getattr(self.parent, 'winfo_ismapped', None) and self.parent.winfo_ismapped():
+                pw = self.parent.winfo_width()
+                ph = self.parent.winfo_height()
+                px = self.parent.winfo_rootx()
+                py = self.parent.winfo_rooty()
+                x = px + max(0, (pw - w) // 2)
+                y = py + max(0, (ph - h) // 2)
+            else:
+                sw = self.winfo_screenwidth()
+                sh = self.winfo_screenheight()
+                x = max(0, (sw - w) // 2)
+                y = max(0, (sh - h) // 2)
+            self.geometry(f"+{x}+{y}")
+            # Ensure visible and raised
+            self.deiconify()
+            self.lift()
+        except Exception:
+            sw = self.winfo_screenwidth()
+            sh = self.winfo_screenheight()
+            x = max(0, (sw - w) // 2)
+            y = max(0, (sh - h) // 2)
+            self.geometry(f"+{x}+{y}")
+            self.deiconify()
+            self.lift()
+
+    def on_ok(self):
+        username = self.ent_user.get()
+        password = self.ent_pwd.get()
+        self.result = (username, password)
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
+
+    def on_cancel(self):
+        self.result = None
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
+
+
 def main():
     root = tk.Tk()
-    root.withdraw()  # hide during login
+    root.withdraw()  # keep main window hidden until successful login
+
     while True:
-        username = simpledialog.askstring("Login", "Username:", parent=root)
-        if username is None:
+        login = LoginDialog(root)
+        root.wait_window(login)  # modal wait
+
+        if not login.result:
+            # user cancelled -> exit
             return
-        password = simpledialog.askstring("Login", "Password:", show='*', parent=root)
-        if password is None:
-            return
+
+        username, password = login.result
+
         ok, result = attempt_login(username, password)
         if ok:
             session = result
             root.deiconify()
             break
         else:
-            messagebox.showerror("Login failed", f"Login failed: {result}")
+            # show error and loop back to dialog
+            messagebox.showerror("Login failed", f"Login failed: {result}", parent=root)
 
     try:
         style = ttk.Style(root)
@@ -367,6 +482,7 @@ def main():
         pass
     app = MailClientGUI(root, username, session)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()
