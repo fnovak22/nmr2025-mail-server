@@ -1,4 +1,3 @@
-# client.py
 import socket, struct, json, os, threading, hashlib
 from datetime import datetime, timezone
 import tkinter as tk
@@ -11,13 +10,14 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 HOST = '127.0.0.1'
-PORT = 65432
+PORT = 50001
 
 BASE_DIR = os.path.dirname(__file__)
 MAILS_DIR = os.path.join(BASE_DIR, "mails")
 os.makedirs(MAILS_DIR, exist_ok=True)
 
-def recv_all(sock, n):
+# prikupi n bajtova sa socketa, jer je to STREAM (TCP) , nije UDP datagram koji ima svoj size
+def recv_all_bytes_size(sock, n):
     data = b''
     while len(data) < n:
         part = sock.recv(n - len(data))
@@ -26,21 +26,37 @@ def recv_all(sock, n):
         data += part
     return data
 
-def recv_message(sock):
-    hdr = recv_all(sock, 4)
+def recv_message_full_length(sock):
+    hdr = recv_all_bytes_size(sock, 4)
     if not hdr:
         return None
     (length,) = struct.unpack('!I', hdr)
-    return recv_all(sock, length)
+    return recv_all_bytes_size(sock, length)
 
-def send_message(sock, payload: bytes):
+def send_message_with_packed_length(sock, payload: bytes):
     sock.sendall(struct.pack('!I', len(payload)) + payload)
+
+def aesgcm_encrypt_send(aesgcm: AESGCM, sock, data: bytes):
+    """
+    Automatski generira nonce, šifrira data i pošalje preko sock
+    """
+    nonce = os.urandom(12)                   # generiraj 12-bajtni nonce
+    ciphertext = aesgcm.encrypt(nonce, data, None)
+    send_message_with_packed_length(sock, nonce + ciphertext)   # šalje nonce + ciphertext
+
+def aesgcm_recv_decrypt(aesgcm: AESGCM, sock):
+    packed = recv_message_full_length(sock)
+    if not packed:
+        return None
+    nonce_server = packed[:12]
+    cyphertext_tag = packed[12:]
+    return aesgcm.decrypt(nonce_server, cyphertext_tag, None)
 
 # Ephemeral per-connection handshake (forward secrecy)
 def perform_handshake_and_get_aes(sock):
-    server_pub_bytes = recv_all(sock, 32)
+    server_pub_bytes = recv_all_bytes_size(sock, 32)
     if not server_pub_bytes:
-        raise RuntimeError("No server public key")
+        raise RuntimeError("No server public key received!")
     client_priv = X25519PrivateKey.generate()
     client_pub_bytes = client_priv.public_key().public_bytes(
         encoding=serialization.Encoding.Raw,
@@ -48,15 +64,19 @@ def perform_handshake_and_get_aes(sock):
     )
     sock.sendall(client_pub_bytes)
     server_pub = X25519PublicKey.from_public_bytes(server_pub_bytes)
-    shared = client_priv.exchange(server_pub)
-    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b'handshake-server')
+    shared = client_priv.exchange(server_pub) #shared = server_pub ^ client_priv
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=b'handshake-server'
+    )
     aes_key = hkdf.derive(shared)
     return AESGCM(aes_key)
 
 # ---------- Local mail storage helpers ----------
 def user_mailfile(username):
-    safe = username.replace("/", "_")
-    return os.path.join(MAILS_DIR, f"{safe}.json")
+    return os.path.join(MAILS_DIR, f"{username}.json")
 
 def load_local_mails(username):
     path = user_mailfile(username)
@@ -157,17 +177,21 @@ class MailClientGUI:
 
     def _fetch_mail_worker(self):
         try:
-            with socket.create_connection((HOST, PORT), timeout=5) as s:
-                aesgcm = perform_handshake_and_get_aes(s)
+            #SOCK STREAM = TCP
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(5)
+                sock.connect((HOST, PORT))
+
+                aesgcm = perform_handshake_and_get_aes(sock)
                 payload = json.dumps({'type':'fetch','session': self.session}).encode()
-                rn = os.urandom(12)
-                send_message(s, rn + aesgcm.encrypt(rn, payload, None))
-                resp_packed = recv_message(s)
-                if not resp_packed:
+
+                aesgcm_encrypt_send(aesgcm, sock, payload)
+
+                plain = aesgcm_recv_decrypt(aesgcm, sock)
+                if plain is None:
                     messagebox.showerror("Error", "No response from server.")
                     return
-                rn = resp_packed[:12]; ct2 = resp_packed[12:]
-                plain = aesgcm.decrypt(rn, ct2, None)
+                
                 data = json.loads(plain.decode())
                 msgs = data.get('messages', [])
 
@@ -258,8 +282,8 @@ class MailClientGUI:
 
     def _send_worker(self, frm, to, subject, content):
         try:
-            with socket.create_connection((HOST, PORT), timeout=5) as s:
-                aesgcm = perform_handshake_and_get_aes(s)
+            with socket.create_connection((HOST, PORT), timeout=5) as sock:
+                aesgcm = perform_handshake_and_get_aes(sock)
                 timestamp = datetime.now(timezone.utc).isoformat()
                 payload = {
                     'type': 'send',
@@ -272,22 +296,23 @@ class MailClientGUI:
                         'timestamp': timestamp
                     }
                 }
-                b = json.dumps(payload).encode()
-                rn = os.urandom(12)
-                send_message(s, rn + aesgcm.encrypt(rn, b, None))
-                resp_packed = recv_message(s)
-                if resp_packed:
-                    rn2 = resp_packed[:12]; ct2 = resp_packed[12:]
-                    plain = aesgcm.decrypt(rn2, ct2, None)
-                    resp = json.loads(plain.decode())
-                    if resp.get('status') == 'ok':
-                        self.root.after(0, lambda: self.clear_send_fields())
-                        messagebox.showinfo("Sent", "Message sent successfully.")
-                        return
-                    else:
-                        messagebox.showerror("Error", f"Send failed: {resp.get('error')}")
-                        return
-                messagebox.showwarning("Sent?", "Server did not ack success.")
+                bytes_to_send = json.dumps(payload).encode()
+                aesgcm_encrypt_send(aesgcm, sock, bytes_to_send)
+                
+                plain = aesgcm_recv_decrypt(aesgcm, sock)
+                if plain is None:
+                    messagebox.showwarning("Unknown send status", "Server did not send status.")
+                    return
+
+                resp = json.loads(plain.decode())
+                if resp.get('status') == 'ok':
+                    self.root.after(0, lambda: self.clear_send_fields())
+                    messagebox.showinfo("Sent", "Message sent successfully.")
+                    return
+                else:
+                    messagebox.showerror("Error", f"Send failed: {resp.get('error')}")
+                    return
+                    
         except Exception as e:
             messagebox.showerror("Error", f"Send failed: {e}")
 
@@ -299,16 +324,16 @@ class MailClientGUI:
 # ---------- Login helper ----------
 def attempt_login(username, password):
     try:
-        with socket.create_connection((HOST, PORT), timeout=5) as s:
-            aesgcm = perform_handshake_and_get_aes(s)
+        with socket.create_connection((HOST, PORT), timeout=5) as sock:
+            aesgcm = perform_handshake_and_get_aes(sock)
             payload = json.dumps({'type':'login','username':username,'password':password}).encode()
-            rn = os.urandom(12)
-            send_message(s, rn + aesgcm.encrypt(rn, payload, None))
-            resp_packed = recv_message(s)
-            if not resp_packed:
+
+            aesgcm_encrypt_send(aesgcm, sock, payload)
+
+            plain = aesgcm_recv_decrypt(aesgcm, sock)
+            if plain is None:
                 return False, "No response"
-            rn2 = resp_packed[:12]; ct2 = resp_packed[12:]
-            plain = aesgcm.decrypt(rn2, ct2, None)
+
             data = json.loads(plain.decode())
             if data.get('status') == 'ok':
                 return True, data.get('session')
