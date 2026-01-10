@@ -141,8 +141,9 @@ class MailClientGUI:
         top.pack(fill='x', padx=6, pady=6)
         ttk.Label(top, text=f"Logged in as: {self.username}").pack(side='left')
         ttk.Button(top, text="Fetch mail", command=self.fetch_mail).pack(side='left', padx=8)
-        ttk.Button(top, text="Logout", command=self.logout).pack(side='right')
+        ttk.Button(top, text="Mark as Unread", command=self.mark_as_unread).pack(side='left', padx=8)
         ttk.Button(top, text="Delete", command=self.delete_selected_mail).pack(side='left', padx=8)
+        ttk.Button(top, text="Logout", command=self.logout).pack(side='right')
 
         mid = ttk.Frame(frame)
         mid.pack(fill='both', expand=True, padx=6, pady=6)
@@ -161,8 +162,8 @@ class MailClientGUI:
         self.tree.column('read', width=50, anchor='center')
         self.tree.pack(side='left', fill='both', expand=True)
 
-        self.tree.bind("<Double-1>", self.on_tree_double)
         self.tree.bind("<Button-1>", self.on_tree_click)
+        self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
 
         right = ttk.Frame(mid)
         right.pack(side='right', fill='both', expand=True)
@@ -179,7 +180,7 @@ class MailClientGUI:
 
         self.loader_gif = Image.open("loader.gif")
         self.loader_frames = []
-        desired_size = (24, 24)  # Set your desired width and height here
+        desired_size = (24, 24)
         try:
             while True:
                 frame = self.loader_gif.copy().resize(desired_size, Image.LANCZOS)
@@ -247,6 +248,23 @@ class MailClientGUI:
         self.load_mails_into_tree(self.current_username, self.current_mails)
         self.content_box.delete('1.0', tk.END)
 
+    def mark_as_unread(self):
+        if not self.selected_ids:
+            messagebox.showinfo("Mark as Unread", "No messages selected.")
+            return
+        changed = False
+        for mid in self.selected_ids:
+            m = next((x for x in self.current_mails if x['id'] == mid), None)
+            if m and m.get('read'):
+                m['read'] = False
+                self.tree.set(mid, 'read', '')
+                changed = True
+        if changed:
+            save_local_mails(self.current_username, self.current_mails)
+        for mid in list(self.selected_ids):
+            self.tree.set(mid, 'select', '\u2610')
+        self.selected_ids.clear()
+
     def fetch_mail(self):
         self.show_loader()
         threading.Thread(target=self._fetch_mail_worker, daemon=True).start()
@@ -303,7 +321,7 @@ class MailClientGUI:
             self.tree.insert('', 'end', iid=m['id'], values=('\u2610', subj, frm, ts, read_flag))
         self.content_box.delete('1.0', tk.END)
 
-    def on_tree_double(self, event):
+    def on_tree_select(self, event):
         sel = self.tree.selection()
         if not sel:
             return
@@ -311,13 +329,13 @@ class MailClientGUI:
         m = next((x for x in self.current_mails if x['id'] == mid), None)
         if not m:
             return
-        m['read'] = not bool(m.get('read'))
-        read_flag = '✓' if m['read'] else ''
-        self.tree.set(mid, 'read', read_flag)
+        if not m.get('read'):
+            m['read'] = True
+            self.tree.set(mid, 'read', '✓')
+            save_local_mails(self.current_username, self.current_mails)
         self.content_box.delete('1.0', tk.END)
         display = f"From: {m.get('from')}\nSubject: {m.get('subject')}\nTime: {m.get('timestamp')}\n\n{m.get('content')}"
         self.content_box.insert(tk.END, display)
-        save_local_mails(self.current_username, self.current_mails)
 
     def on_tree_click(self, event):
         region = self.tree.identify("region", event.x, event.y)
