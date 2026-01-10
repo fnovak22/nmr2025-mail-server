@@ -146,6 +146,7 @@ class MailClientGUI:
         top.pack(fill='x', padx=6, pady=6)
         ttk.Label(top, text=f"Logged in as: {self.username}").pack(side='left')
         ttk.Button(top, text="Fetch mail", command=self.fetch_mail).pack(side='left', padx=8)
+        ttk.Button(top, text="Logout", command=self.logout).pack(side='right')
 
         mid = ttk.Frame(frame)
         mid.pack(fill='both', expand=True, padx=6, pady=6)
@@ -172,6 +173,39 @@ class MailClientGUI:
 
         self.current_mails = []
         self.current_username = self.username
+
+    def logout(self):
+        if not messagebox.askyesno("Logout", "Are you sure you want to logout?"):
+            return
+
+        # zatvori GUI
+        self.root.withdraw()
+
+        # očisti state (nije strogo nužno, ali je uredno)
+        self.username = None
+        self.session = None
+
+        # pokreni login ponovo
+        self.root.after(0, self._show_login_again)
+
+    def _show_login_again(self):
+        # ukloni stari UI
+        for w in self.root.winfo_children():
+            w.destroy()
+
+        while True:
+            login = LoginDialog(self.root)
+            self.root.wait_window(login)
+
+            if not login.result:
+                # korisnik cancel → zatvori app
+                self.root.destroy()
+                return
+
+            username, session = login.result
+            self.root.deiconify()
+            MailClientGUI(self.root, username, session)
+            return
 
     def fetch_mail(self):
         threading.Thread(target=self._fetch_mail_worker, daemon=True).start()
@@ -582,6 +616,13 @@ class LoginDialog(tk.Toplevel):
 
 def main():
     root = tk.Tk()
+    
+    try:
+        style = ttk.Style(root)
+        style.theme_use('clam')
+    except Exception:
+        pass
+
     root.withdraw()  # keep main window hidden until successful login
 
     while True:
@@ -597,11 +638,7 @@ def main():
         root.deiconify()
         break
 
-    try:
-        style = ttk.Style(root)
-        style.theme_use('clam')
-    except Exception:
-        pass
+
     app = MailClientGUI(root, username, session)
     root.mainloop()
 
