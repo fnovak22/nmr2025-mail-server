@@ -1,7 +1,7 @@
 import socket, struct, json, os, threading, hashlib
 from datetime import datetime, timezone
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox
 from tkinter.scrolledtext import ScrolledText
 from PIL import Image, ImageTk
 
@@ -132,6 +132,7 @@ class MailClientGUI:
 
         root.title(f"Mail Client - {self.username}")
         self.notebook = ttk.Notebook(root)
+        self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_changed)
         self.notebook.pack(fill='both', expand=True, padx=6, pady=6)
 
         self.build_inbox_tab()
@@ -150,6 +151,9 @@ class MailClientGUI:
         ttk.Button(top, text="Fetch mail", command=self.fetch_mail).pack(side='left', padx=8)
         ttk.Button(top, text="Mark as Unread", command=self.mark_as_unread).pack(side='left', padx=8)
         ttk.Button(top, text="Delete", command=self.delete_selected_mail).pack(side='left', padx=8)
+        self.status_label = ttk.Label(top, text="", foreground="red")
+        self.status_label.pack(side='left', padx=8)
+        self.status_label.pack_forget()
         ttk.Button(top, text="Logout", command=self.logout).pack(side='right')
 
         mid = ttk.Frame(frame)
@@ -227,6 +231,17 @@ class MailClientGUI:
             MailClientGUI(self.root, username, session)
             return
 
+    def on_tab_changed(self, event):
+        self.status_label.pack_forget()
+        
+        for mid in list(getattr(self, 'selected_ids', [])):
+            self.tree.set(mid, 'select', '\u2610')
+        self.selected_ids.clear()
+        
+        self.content_box.delete('1.0', tk.END)
+
+        self.tree.selection_remove(self.tree.selection())
+
     def show_loader(self):
         self.loader_label.pack(side='left', padx=8)
         self.loader_animating = True
@@ -246,9 +261,8 @@ class MailClientGUI:
 
     def delete_selected_mail(self):
         if not self.selected_ids:
-            messagebox.showinfo("Delete", "No messages selected.")
-            return
-        if not messagebox.askyesno("Delete", f"Are you sure you want to delete {len(self.selected_ids)} message(s)?"):
+            self.status_label.config(text="No messages selected.")
+            self.status_label.pack(side='left', padx=8)
             return
         self.current_mails = [m for m in self.current_mails if m['id'] not in self.selected_ids]
         save_local_mails(self.current_username, self.current_mails)
@@ -257,7 +271,8 @@ class MailClientGUI:
 
     def mark_as_unread(self):
         if not self.selected_ids:
-            messagebox.showinfo("Mark as Unread", "No messages selected.")
+            self.status_label.config(text="No messages selected.")
+            self.status_label.pack(side='left', padx=8)
             return
         changed = False
         for mid in self.selected_ids:
@@ -329,6 +344,7 @@ class MailClientGUI:
         self.content_box.delete('1.0', tk.END)
 
     def on_tree_select(self, event):
+        self.status_label.pack_forget()
         sel = self.tree.selection()
         if not sel:
             return
@@ -345,6 +361,7 @@ class MailClientGUI:
         self.content_box.insert(tk.END, display)
 
     def on_tree_click(self, event):
+        self.status_label.pack_forget()
         region = self.tree.identify("region", event.x, event.y)
         if region != "cell":
             return
@@ -366,27 +383,31 @@ class MailClientGUI:
         self.notebook.add(frame, text="Send")
 
         frm = ttk.Frame(frame)
-        frm.pack(fill='x', padx=6, pady=6)
+        frm.pack(fill='both', expand=True, padx=6, pady=6)
+
         ttk.Label(frm, text="From:").grid(row=0, column=0, sticky='w')
-        self.send_from = ttk.Entry(frm, width=30)
-        self.send_from.grid(row=0, column=1, padx=6, pady=4)
+        self.send_from = ttk.Entry(frm)
+        self.send_from.grid(row=0, column=1, sticky='ew', padx=6, pady=4)
         self.send_from.insert(0, self.username)
         self.send_from.config(state='disabled')
 
         ttk.Label(frm, text="To:").grid(row=1, column=0, sticky='w')
-        self.send_to = ttk.Entry(frm, width=30)
-        self.send_to.grid(row=1, column=1, padx=6, pady=4)
+        self.send_to = ttk.Entry(frm)
+        self.send_to.grid(row=1, column=1, sticky='ew', padx=6, pady=4)
 
         ttk.Label(frm, text="Subject:").grid(row=2, column=0, sticky='w')
-        self.send_subject = ttk.Entry(frm, width=50)
-        self.send_subject.grid(row=2, column=1, padx=6, pady=4)
+        self.send_subject = ttk.Entry(frm)
+        self.send_subject.grid(row=2, column=1, sticky='ew', padx=6, pady=4)
 
         ttk.Label(frm, text="Content:").grid(row=3, column=0, sticky='nw')
-        self.send_content = ScrolledText(frm, width=60, height=10)
-        self.send_content.grid(row=3, column=1, padx=6, pady=4)
+        self.send_content = ScrolledText(frm)
+        self.send_content.grid(row=3, column=1, sticky='nsew', padx=6, pady=4)
 
         btn = ttk.Button(frm, text="Send", command=self.do_send)
         btn.grid(row=4, column=1, sticky='e', pady=6)
+
+        frm.columnconfigure(1, weight=1)
+        frm.rowconfigure(3, weight=1)
 
     def do_send(self):
         frm = self.username
@@ -425,7 +446,6 @@ class MailClientGUI:
                 resp = json.loads(plain.decode())
                 if resp.get('status') == 'ok':
                     self.root.after(0, lambda: self.clear_send_fields())
-                    messagebox.showinfo("Sent", "Message sent successfully.")
                     return
                 else:
                     messagebox.showerror("Error", f"Send failed: {resp.get('error')}")
