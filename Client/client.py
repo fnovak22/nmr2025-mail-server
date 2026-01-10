@@ -342,7 +342,28 @@ def attempt_login(username, password):
     except Exception as e:
         return False, str(e)
 
-# ---------- Robust Login dialog (works when root.withdraw() is set) ----------
+# ---------- Login helper ----------
+def attempt_login(username, password):
+    try:
+        with socket.create_connection((HOST, PORT), timeout=5) as sock:
+            aesgcm = perform_handshake_and_get_aes(sock)
+            payload = json.dumps({'type':'login','username':username,'password':password}).encode()
+
+            aesgcm_encrypt_send(aesgcm, sock, payload)
+
+            plain = aesgcm_recv_decrypt(aesgcm, sock)
+            if plain is None:
+                return False, "No response"
+
+            data = json.loads(plain.decode())
+            if data.get('status') == 'ok':
+                return True, data.get('session')
+            else:
+                return False, data.get('error', 'auth failed')
+    except Exception as e:
+        return False, str(e)
+
+# ---------- Robust Login dialog with status label ----------
 class LoginDialog(tk.Toplevel):
     def __init__(self, parent):
         # Napravi Toplevel; nemoj se oslanjati potpuno na parent ako je withdrawn
@@ -352,6 +373,11 @@ class LoginDialog(tk.Toplevel):
 
         self.title("Login")
         self.resizable(False, False)
+
+        # state
+        self._logging = False
+        # worker will write (ok, result, username) here; polled by main thread
+        self._login_response = None
 
         # Modal behavior
         try:
@@ -383,11 +409,15 @@ class LoginDialog(tk.Toplevel):
         self.ent_pwd.grid(row=1, column=1, pady=(0,6))
 
         btn_frame = ttk.Frame(frm)
-        btn_frame.grid(row=2, column=0, columnspan=2, pady=(8,0), sticky='e')
-        ok_btn = ttk.Button(btn_frame, text="OK", command=self.on_ok)
-        ok_btn.pack(side='right', padx=(0,6))
-        cancel_btn = ttk.Button(btn_frame, text="Cancel", command=self.on_cancel)
-        cancel_btn.pack(side='right')
+        btn_frame.grid(row=3, column=0, columnspan=2, pady=(8,0), sticky='e')
+        self.ok_btn = ttk.Button(btn_frame, text="OK", command=self.on_ok)
+        self.ok_btn.pack(side='right', padx=(0,6))
+        self.cancel_btn = ttk.Button(btn_frame, text="Cancel", command=self.on_cancel)
+        self.cancel_btn.pack(side='right')
+
+        # status label below buttons
+        self.status_label = ttk.Label(frm, text="", anchor='w')
+        self.status_label.grid(row=4, column=0, columnspan=2, sticky='we', pady=(8,0))
 
         self.bind("<Return>", lambda e: self.on_ok())
         self.bind("<Escape>", lambda e: self.on_cancel())
@@ -434,22 +464,124 @@ class LoginDialog(tk.Toplevel):
             self.lift()
 
     def on_ok(self):
+        if self._logging:
+            return
         username = self.ent_user.get()
         password = self.ent_pwd.get()
-        self.result = (username, password)
-        try:
-            self.grab_release()
-        except Exception:
-            pass
-        self.destroy()
+        if not username or not password:
+            self.set_status("Please enter username and password")
+            return
+
+        # disable controls while logging in
+        self._set_controls_state('disabled')
+        self._logging = True
+        self.set_status("Logging in...")
+
+        # clear any previous response
+        self._login_response = None
+
+        # start background login (worker will only set self._login_response)
+        threading.Thread(target=self._login_worker, args=(username, password), daemon=True).start()
+
+        # start polling from the main thread for worker's result
+        self.after(100, self._poll_login_response)
 
     def on_cancel(self):
+        # if currently logging, prevent cancel to avoid race conditions; user can close window after failure
+        if self._logging:
+            return
         self.result = None
         try:
             self.grab_release()
         except Exception:
             pass
         self.destroy()
+
+    def _login_worker(self, username, password):
+        try:
+            ok, result = attempt_login(username, password)
+        except Exception as e:
+            ok, result = False, str(e)
+        # do NOT call tkinter methods from this thread
+        # instead store the result in a variable the main thread will check
+        self._login_response = (ok, result, username)
+
+    def _poll_login_response(self):
+        """
+        Called on the main thread via after(): checks whether worker filled
+        self._login_response. If not, schedule another check.
+        """
+        # If dialog was destroyed meanwhile, stop polling
+        if not getattr(self, 'winfo_exists', lambda: True)():
+            return
+
+        if self._login_response is None:
+            # keep polling until worker sets the response
+            self.after(100, self._poll_login_response)
+            return
+
+        # we have a response; grab it and handle it on the main thread
+        ok, result, username = self._login_response
+        self._login_response = None
+        self._logging = False
+
+        if ok:
+            # successful login -> set result to (username, session_token) and close dialog
+            self.result = (username, result)
+            try:
+                self.grab_release()
+            except Exception:
+                pass
+            self.destroy()
+            return
+        else:
+            # show error in status label and re-enable controls
+            self.set_status(f"Login failed: {result}", is_error=True)
+            self._set_controls_state('normal')
+            self.ent_pwd.focus_set()
+
+    def _set_controls_state(self, state):
+        try:
+            if state == 'disabled':
+                try:
+                    self.ok_btn.state(['disabled'])
+                except Exception:
+                    self.ok_btn.config(state='disabled')
+                try:
+                    self.cancel_btn.state(['disabled'])
+                except Exception:
+                    self.cancel_btn.config(state='disabled')
+                try:
+                    self.ent_user.config(state='disabled')
+                    self.ent_pwd.config(state='disabled')
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.ok_btn.state(['!disabled'])
+                except Exception:
+                    self.ok_btn.config(state='normal')
+                try:
+                    self.cancel_btn.state(['!disabled'])
+                except Exception:
+                    self.cancel_btn.config(state='normal')
+                try:
+                    self.ent_user.config(state='normal')
+                    self.ent_pwd.config(state='normal')
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def set_status(self, text, is_error=False):
+        try:
+            if is_error:
+                self.status_label.config(text=text, foreground='red')
+            else:
+                # normal / info state
+                self.status_label.config(text=text, foreground='black')
+        except Exception:
+            pass
 
 
 def main():
@@ -464,16 +596,10 @@ def main():
             # user cancelled -> exit
             return
 
-        username, password = login.result
-
-        ok, result = attempt_login(username, password)
-        if ok:
-            session = result
-            root.deiconify()
-            break
-        else:
-            # show error and loop back to dialog
-            messagebox.showerror("Login failed", f"Login failed: {result}", parent=root)
+        username, session = login.result
+        # successful login -> show main window
+        root.deiconify()
+        break
 
     try:
         style = ttk.Style(root)
