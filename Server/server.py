@@ -2,12 +2,11 @@ import socket, threading, struct, json, os
 import tkinter as tk
 from tkinter.scrolledtext import ScrolledText
 
-from cryptography.hazmat.primitives.asymmetric.x25519 import (
-    X25519PrivateKey, X25519PublicKey
-)
+from cryptography.hazmat.primitives.asymmetric.x25519 import (X25519PrivateKey, X25519PublicKey)
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from datetime import datetime
 
 HOST = '127.0.0.1'
 PORT = 50001
@@ -42,9 +41,6 @@ def send_message(sock, payload: bytes):
     sock.sendall(struct.pack('!I', len(payload)) + payload)
 
 def aesgcm_encrypt_send(aesgcm: AESGCM, conn, data: bytes):
-    """
-    Automatski generira nonce, šifrira data i pošalje
-    """
     nonce = os.urandom(12)
     ciphertext = aesgcm.encrypt(nonce, data, None)
     send_message(conn, nonce + ciphertext)
@@ -58,11 +54,6 @@ def aesgcm_recv_decrypt(aesgcm: AESGCM, conn):
     return aesgcm.decrypt(nonce_client, cyphertext_tag, None)
 
 def server_handshake(conn):
-    """
-    Ephemeral Diffie-Hellman handshake (X25519) sa clientom.
-    Vraća: AESGCM instancu spremnu za enkripciju/dekripciju.
-    Zatvara konekciju ako handshake ne uspije.
-    """
     try:
         server_priv = X25519PrivateKey.generate()
         server_pub_bytes = server_priv.public_key().public_bytes(
@@ -94,8 +85,7 @@ def server_handshake(conn):
 
 def handle_client(conn, addr, gui_append):
     """
-    Per-connection ephemeral handshake, plus handling of:
-    - login: {type: 'login', username, password} -> returns session token
+    - login: {type: 'login', username, password}
     - send:  {type: 'send', session, from, to, message}
     - fetch: {type: 'fetch', session}
     """
@@ -120,40 +110,40 @@ def handle_client(conn, addr, gui_append):
                 gui_append(f"[ERROR][{addr}] decryption failed: {e}")
                 continue
 
-            typ = data.get('type')
-            if typ == 'login':
+            messag_type = data.get('type')
+            if messag_type == 'login':
                 username = data.get('username')
                 password = data.get('password')
                 if username in USERS and USERS[username] == password:
-                    token = os.urandom(16).hex()
+                    new_session_token = os.urandom(16).hex()
                     with sessions_lock:
-                        sessions[token] = username
-                    resp = json.dumps({'status':'ok','session': token}).encode()
+                        sessions[new_session_token] = username
+                    resp = json.dumps({'status':'ok','session': new_session_token}).encode()
 
                     aesgcm_encrypt_send(aesgcm, conn, resp)
 
-                    gui_append(f"[AUTH][{addr}] Authenticated {username} (session {token[:8]}...)")
+                    gui_append(f"[AUTH][{addr}] Authenticated {username} (session {new_session_token[:8]}...)")
                 else:
                     resp = json.dumps({'status':'fail','error':'invalid credentials'}).encode()
                     aesgcm_encrypt_send(aesgcm, conn, resp)
-                    gui_append(f"[AUTH][{addr}] Auth failed for {username}")
+                    gui_append(f"[ERROR][{addr}] Auth failed for {username}")
                 continue
 
-            session = data.get('session')
-            if not session:
+            session_token = data.get('session')
+            if not session_token:
                 resp = json.dumps({'status':'fail','error':'no session'}).encode()
                 aesgcm_encrypt_send(aesgcm, conn, resp)
-                gui_append(f"[WARN][{addr}] message without session")
+                gui_append(f"[ERROR][{addr}] message without session")
                 continue
             with sessions_lock:
-                authed_user = sessions.get(session)
+                authed_user = sessions.get(session_token)
             if not authed_user:
                 resp = json.dumps({'status':'fail','error':'invalid session'}).encode()
                 aesgcm_encrypt_send(aesgcm, conn, resp)
-                gui_append(f"[WARN][{addr}] invalid session used: {session[:8]}...")
+                gui_append(f"[ERROR][{addr}] invalid session token: {session_token[:8]}...")
                 continue
 
-            if typ == 'send':
+            if messag_type == 'send':
                 sender = data.get('from')
                 to = data.get('to')
                 text = data.get('message')
@@ -177,7 +167,7 @@ def handle_client(conn, addr, gui_append):
                 resp = json.dumps({'status':'ok'}).encode()
                 aesgcm_encrypt_send(aesgcm, conn, resp)
 
-            elif typ == 'fetch':
+            elif messag_type == 'fetch':
                 user = authed_user
                 msgs = inboxes.get(user, [])
                 resp = json.dumps({'messages': msgs}).encode()
@@ -186,7 +176,7 @@ def handle_client(conn, addr, gui_append):
                 gui_append(f"[MAIL][{addr}] Delivered {len(msgs)} messages to {user}")
 
             else:
-                gui_append(f"[WARN][{addr}] Unknown type: {typ}")
+                gui_append(f"[ERROR][{addr}] Unknown type: {messag_type}")
                 resp = json.dumps({'status':'fail','error':'unknown type'}).encode()
                 aesgcm_encrypt_send(aesgcm, conn, resp)
 
@@ -195,13 +185,12 @@ def handle_client(conn, addr, gui_append):
 
 def start_gui():
     root = tk.Tk()
-    root.title("Simple Mail Server - inboxes")
-    root.geometry("750x450")
+    root.title("Server log")
+    root.geometry("800x400")
 
     st = ScrolledText(root, width=120, height=24, state='disabled')
     st.pack(fill='both', expand=True, padx=8, pady=8)
 
-    from datetime import datetime
     def gui_append(s):
         now = datetime.now().strftime('%H:%M:%S')
         st.config(state='normal')
@@ -210,13 +199,15 @@ def start_gui():
         st.config(state='disabled')
 
     def server_thread():
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind((HOST, PORT))
-            s.listen()
-            gui_append(f"[INFO] Server listening on {HOST}:{PORT}")
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+            sock.bind((HOST, PORT))
+            sock.listen()
+
+            gui_append(f"[INFO] Server is listening on {HOST}:{PORT}")
             while True:
-                conn, addr = s.accept()
+                conn, addr = sock.accept()
                 gui_append(f"[INFO] Accepted connection from {addr}")
                 threading.Thread(target=handle_client, args=(conn, addr, gui_append), daemon=True).start()
 

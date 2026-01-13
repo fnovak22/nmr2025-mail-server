@@ -11,11 +11,12 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import errno
 
-HOST = '127.0.0.1'
-PORT = 50001
+SERVER_ADDRESS = '127.0.0.1'
+SERVER_PORT = 50001
 
 BASE_DIR = os.path.dirname(__file__)
 MAILS_DIR = os.path.join(BASE_DIR, "mails")
+GIF_PATH = os.path.join(BASE_DIR, "loader.gif")
 os.makedirs(MAILS_DIR, exist_ok=True)
 
 def recv_all_bytes_size(sock, n):
@@ -96,7 +97,7 @@ def make_msg_id(from_user, subject, content, timestamp):
     base = (str(from_user) + (subject or "") + (content or "") + (timestamp or "")).encode('utf-8')
     return hashlib.sha256(base).hexdigest()
 
-def normalize_incoming(m):
+def normalize_incoming_mail(m):
     frm = m.get('from', '')
     message = m.get('message')
     if isinstance(message, dict):
@@ -189,7 +190,7 @@ class MailClientGUI:
         self.loader_label.pack(side='left', padx=8)
         self.loader_label.pack_forget()
 
-        self.loader_gif = Image.open("loader.gif")
+        self.loader_gif = Image.open(GIF_PATH)
         self.loader_frames = []
         desired_size = (24, 24)
         try:
@@ -295,7 +296,7 @@ class MailClientGUI:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(5)
-                sock.connect((HOST, PORT))
+                sock.connect((SERVER_ADDRESS, SERVER_PORT))
 
                 aesgcm = perform_handshake_and_get_aes(sock)
                 payload = json.dumps({'type':'fetch','session': self.session}).encode()
@@ -310,7 +311,7 @@ class MailClientGUI:
                 data = json.loads(plain.decode())
                 msgs = data.get('messages', [])
 
-                normalized = [normalize_incoming(m) for m in msgs]
+                normalized = [normalize_incoming_mail(m) for m in msgs]
 
                 local = load_local_mails(self.username)
                 local_ids = {m['id']: m for m in local}
@@ -421,7 +422,10 @@ class MailClientGUI:
 
     def _send_worker(self, frm, to, subject, content):
         try:
-            with socket.create_connection((HOST, PORT), timeout=5) as sock:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(5)
+                sock.connect((SERVER_ADDRESS, SERVER_PORT))
+
                 aesgcm = perform_handshake_and_get_aes(sock)
                 timestamp = datetime.now(timezone.utc).isoformat()
                 payload = {
@@ -465,7 +469,10 @@ def attempt_login(username, password):
     'Login error: Cant connect to server' umjesto sirovog WinError/OS poruke.
     """
     try:
-        with socket.create_connection((HOST, PORT), timeout=5) as sock:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(5)
+            sock.connect((SERVER_ADDRESS, SERVER_PORT))
+
             aesgcm = perform_handshake_and_get_aes(sock)
             payload = json.dumps({'type':'login','username':username,'password':password}).encode()
 
