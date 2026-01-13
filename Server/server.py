@@ -77,6 +77,8 @@ def server_handshake(conn):
             info=b'handshake-server'
         )
         aes_key = hkdf.derive(shared)
+        print("[DEBUG] AES KEY:", aes_key.hex())
+
         return AESGCM(aes_key)
 
     except Exception:
