@@ -236,11 +236,12 @@ class MailClientGUI:
 
     def on_tab_changed(self, event):
         self.status_label.pack_forget()
-        
+        self.send_status_label.config(text="")
+
         for mid in list(getattr(self, 'selected_ids', [])):
             self.tree.set(mid, 'select', '\u2610')
         self.selected_ids.clear()
-        
+
         self.content_box.delete('1.0', tk.END)
 
         self.tree.selection_remove(self.tree.selection())
@@ -307,7 +308,11 @@ class MailClientGUI:
 
                 plain = aesgcm_recv_decrypt(aesgcm, sock)
                 if plain is None:
-                    messagebox.showerror("Error", "No response from server.")
+                    self.root.after(0, lambda: (
+                        self.status_label.pack(side='left', padx=8),
+                        self.hide_loader(),
+                        self.status_label.config(text="No response from server."),
+                    ))
                     return
                 
                 data = json.loads(plain.decode())
@@ -330,8 +335,11 @@ class MailClientGUI:
                 self.root.after(0, lambda: self.load_mails_into_tree(self.username, local))
                 self.root.after(600, self.hide_loader)
         except Exception as e:
-            self.root.after(600, self.hide_loader)
-            messagebox.showerror("Error", f"Fetch failed: {e}")
+            def show_error(err=e):
+                self.status_label.pack(side='left', padx=8)
+                self.hide_loader()
+                self.status_label.config(text=f"Fetch failed: {err}")
+            self.root.after(0, show_error)
 
     def load_mails_into_tree(self, username, mail_list):
         self.tree.delete(*self.tree.get_children())
@@ -406,11 +414,23 @@ class MailClientGUI:
         self.send_content = ScrolledText(frm)
         self.send_content.grid(row=3, column=1, sticky='nsew', padx=6, pady=4)
 
-        btn = ttk.Button(frm, text="Send", command=self.do_send)
-        btn.grid(row=4, column=1, sticky='e', pady=6)
+        btn_status_frame = ttk.Frame(frm)
+        btn_status_frame.grid(row=4, column=1, sticky='ew', pady=6)
+        btn_status_frame.columnconfigure(0, weight=1)
+        btn_status_frame.columnconfigure(1, weight=0)
+
+        self.send_status_label = ttk.Label(btn_status_frame, text="", anchor='w', foreground='red')
+        self.send_status_label.grid(row=0, column=0, sticky='w')
+
+        btn = ttk.Button(btn_status_frame, text="Send", command=self.do_send)
+        btn.grid(row=0, column=1, sticky='e', padx=(8,0))
 
         frm.columnconfigure(1, weight=1)
         frm.rowconfigure(3, weight=1)
+
+    def set_send_status(self, text, is_error=True):
+        color = 'red' if is_error else 'black'
+        self.send_status_label.config(text=text, foreground=color)
 
     def do_send(self):
         frm = self.username
@@ -418,8 +438,9 @@ class MailClientGUI:
         subject = self.send_subject.get().strip()
         content = self.send_content.get("1.0", tk.END).strip()
         if not frm or not to or not subject or not content:
-            messagebox.showwarning("Missing", "All fields (From, To, Subject, Content) must be filled.")
+            self.set_send_status("All fields (From, To, Subject, Content) must be filled.", is_error=True)
             return
+        self.set_send_status("Sending...", is_error=False)
         threading.Thread(target=self._send_worker, args=(frm,to,subject,content), daemon=True).start()
 
     def _send_worker(self, frm, to, subject, content):
@@ -446,24 +467,25 @@ class MailClientGUI:
                 
                 plain = aesgcm_recv_decrypt(aesgcm, sock)
                 if plain is None:
-                    messagebox.showwarning("Unknown send status", "Server did not send status.")
+                    self.root.after(0, lambda: self.set_send_status("Server did not send status.", is_error=True))
                     return
 
                 resp = json.loads(plain.decode())
                 if resp.get('status') == 'ok':
-                    self.root.after(0, lambda: self.clear_send_fields())
+                    self.root.after(0, lambda: [self.clear_send_fields(), self.set_send_status("Sent successfully.", is_error=False)])
                     return
                 else:
-                    messagebox.showerror("Error", f"Send failed: {resp.get('error')}")
+                    self.root.after(0, lambda: self.set_send_status(f"Send failed: {resp.get('error')}", is_error=True))
                     return
                     
         except Exception as e:
-            messagebox.showerror("Error", f"Send failed: {e}")
+            self.root.after(0, lambda: self.set_send_status(f"Send failed: {e}", is_error=True))
 
     def clear_send_fields(self):
         self.send_to.delete(0, tk.END)
         self.send_subject.delete(0, tk.END)
         self.send_content.delete('1.0', tk.END)
+        self.set_send_status("", is_error=False)
 
 def attempt_login(username, password):
     """
