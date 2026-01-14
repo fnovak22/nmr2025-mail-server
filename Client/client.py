@@ -73,8 +73,7 @@ def perform_handshake_and_get_aes(sock):
         info=b'handshake-server'
     )
     aes_key = hkdf.derive(shared)
-
-    print("[DEBUG] AES KEY:", aes_key.hex())
+    #print("[DEBUG] AES KEY:", aes_key.hex())
     return AESGCM(aes_key)
 
 def user_mailfile(username):
@@ -207,7 +206,7 @@ class MailClientGUI:
         self.loader_animating = False
 
     def logout(self):
-        if not messagebox.askyesno("Logout", "Are you sure you want to logout?"):
+        if not messagebox.askyesno("Logout", "Are you sure?"):
             return
 
         self.root.withdraw()
