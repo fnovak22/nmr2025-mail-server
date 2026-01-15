@@ -39,9 +39,6 @@ def send_message_with_packed_length(sock, payload: bytes):
     sock.sendall(struct.pack('!I', len(payload)) + payload)
 
 def aesgcm_encrypt_send(aesgcm: AESGCM, sock, data: bytes):
-    """
-    Automatski generira nonce, šifrira data i pošalje preko sock
-    """
     nonce = os.urandom(12)
     ciphertext = aesgcm.encrypt(nonce, data, None)
     send_message_with_packed_length(sock, nonce + ciphertext)
@@ -89,29 +86,24 @@ def load_local_mails(username):
     except Exception:
         return []
 
-def save_local_mails(username, mails):
-    path = user_mailfile(username)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(mails, f, ensure_ascii=False, indent=2)
+def save_local_mails(username, mails_list):
+    path_to_json = user_mailfile(username)
+    with open(path_to_json, "w", encoding="utf-8") as mail_file:
+        json.dump(mails_list, mail_file, ensure_ascii=False, indent=2)
 
-def make_msg_id(from_user, subject, content, timestamp):
+def generate_message_hash(from_user, subject, content, timestamp):
     base = (str(from_user) + (subject or "") + (content or "") + (timestamp or "")).encode('utf-8')
     return hashlib.sha256(base).hexdigest()
 
-def normalize_incoming_mail(m):
-    frm = m.get('from', '')
-    message = m.get('message')
-    if isinstance(message, dict):
-        subject = message.get('subject', '')
-        content = message.get('content', '')
-        timestamp = message.get('timestamp') or datetime.now(timezone.utc).isoformat()
-    else:
-        subject = ''
-        content = str(message or '')
-        timestamp = datetime.now(timezone.utc).isoformat()
-    mid = make_msg_id(frm, subject, content, timestamp)
+def normalize_incoming_mail(mail_json):
+    frm = mail_json.get('from', '')
+    message = mail_json.get('message')
+    subject = message.get('subject', '')
+    content = message.get('content', '')
+    timestamp = message.get('timestamp') or datetime.now(timezone.utc).isoformat()
+    message_id = generate_message_hash(frm, subject, content, timestamp)
     return {
-        'id': mid,
+        'id': message_id,
         'from': frm,
         'subject': subject,
         'content': content,
@@ -119,12 +111,12 @@ def normalize_incoming_mail(m):
         'read': False
     }
 
-def format_timestamp(ts):
+def format_timestamp(timestamp):
     try:
-        dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
-        return dt.strftime('%d.%m.%Y. %H:%M')
+        date_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        return date_time.strftime('%d.%m.%Y. %H:%M')
     except Exception:
-        return ts
+        return timestamp
 
 class MailClientGUI:
     def __init__(self, root, username, session_token):
@@ -214,9 +206,9 @@ class MailClientGUI:
         self.username = None
         self.session = None
 
-        self.root.after(0, self._show_login_again)
+        self.root.after(0, self.show_login_again)
 
-    def _show_login_again(self):
+    def show_login_again(self):
         for w in self.root.winfo_children():
             w.destroy()
 
@@ -292,9 +284,17 @@ class MailClientGUI:
 
     def fetch_mail(self):
         self.show_loader()
-        threading.Thread(target=self._fetch_mail_worker, daemon=True).start()
+        threading.Thread(target=self.fetch_mail_thread, daemon=True).start()
 
-    def _fetch_mail_worker(self):
+    def show_fetch_error(self, message):
+        try:
+            self.status_label.pack(side='left', padx=8)
+            self.hide_loader()
+            self.status_label.config(text=f"Fetch failed: {message}")
+        except tk.TclError:
+            pass
+
+    def fetch_mail_thread(self):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(5)
@@ -307,25 +307,21 @@ class MailClientGUI:
 
                 plain = aesgcm_recv_decrypt(aesgcm, sock)
                 if plain is None:
-                    self.root.after(0, lambda: (
-                        self.status_label.pack(side='left', padx=8),
-                        self.hide_loader(),
-                        self.status_label.config(text="No response from server."),
-                    ))
+                    self.root.after(0, lambda: self.show_fetch_error("No response from server"))
                     return
                 
                 data = json.loads(plain.decode())
                 msgs = data.get('messages', [])
 
-                normalized = [normalize_incoming_mail(m) for m in msgs]
+                normalized_incoming_mail = [normalize_incoming_mail(m) for m in msgs]
 
                 local = load_local_mails(self.username)
                 local_ids = {m['id']: m for m in local}
-                for nm in normalized:
-                    if nm['id'] in local_ids:
-                        nm['read'] = local_ids[nm['id']].get('read', False)
+                for normalized_mail in normalized_incoming_mail:
+                    if normalized_mail['id'] in local_ids:
+                        continue
                     else:
-                        local.append(nm)
+                        local.append(normalized_mail)
                 try:
                     local.sort(key=lambda x: x.get('timestamp',''), reverse=True)
                 except Exception:
@@ -333,12 +329,24 @@ class MailClientGUI:
                 save_local_mails(self.username, local)
                 self.root.after(0, lambda: self.load_mails_into_tree(self.username, local))
                 self.root.after(600, self.hide_loader)
-        except Exception as e:
-            def show_error(err=e):
-                self.status_label.pack(side='left', padx=8)
-                self.hide_loader()
-                self.status_label.config(text=f"Fetch failed: {err}")
-            self.root.after(0, show_error)
+
+        except (socket.timeout, ConnectionRefusedError, socket.gaierror):
+            self.root.after(0, lambda: self.show_fetch_error("Failed to connect to server"))
+
+        except OSError as e:
+            if getattr(e, 'errno', None) in (
+                errno.ECONNREFUSED,
+                errno.ENETUNREACH,
+                errno.EHOSTUNREACH,
+                errno.ECONNRESET
+            ):
+                self.root.after(0, lambda: self.show_fetch_error("Failed to connect to server"))
+            else:
+                self.root.after(0, lambda: self.show_fetch_error("Unexpected error"))
+
+        except Exception:
+            self.root.after(0, lambda: self.show_fetch_error("Unexpected error"))
+
 
     def load_mails_into_tree(self, username, mail_list):
         self.tree.delete(*self.tree.get_children())
@@ -437,12 +445,12 @@ class MailClientGUI:
         subject = self.send_subject.get().strip()
         content = self.send_content.get("1.0", tk.END).strip()
         if not frm or not to or not subject or not content:
-            self.set_send_status("All fields (From, To, Subject, Content) must be filled.", is_error=True)
+            self.set_send_status("All fields (From, To, Subject, Content) must be filled!", is_error=True)
             return
         self.set_send_status("Sending...", is_error=False)
-        threading.Thread(target=self._send_worker, args=(frm,to,subject,content), daemon=True).start()
+        threading.Thread(target=self.send_mail_thread, args=(frm,to,subject,content), daemon=True).start()
 
-    def _send_worker(self, frm, to, subject, content):
+    def send_mail_thread(self, frm, to, subject, content):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(5)
@@ -462,7 +470,9 @@ class MailClientGUI:
                     }
                 }
                 bytes_to_send = json.dumps(payload).encode()
+                print("A")
                 aesgcm_encrypt_send(aesgcm, sock, bytes_to_send)
+                print("B")
                 
                 plain = aesgcm_recv_decrypt(aesgcm, sock)
                 if plain is None:
@@ -477,8 +487,34 @@ class MailClientGUI:
                     self.root.after(0, lambda: self.set_send_status(f"Send failed: {resp.get('error')}", is_error=True))
                     return
                     
+        except (socket.timeout, ConnectionRefusedError, socket.gaierror):
+            self.root.after(
+                0,
+                lambda: self.set_send_status("Send failed: Failed to connect to server", is_error=True)
+            )
+
+        except OSError as e:
+            if getattr(e, 'errno', None) in (
+                errno.ECONNREFUSED,
+                errno.ENETUNREACH,
+                errno.EHOSTUNREACH,
+                errno.ECONNRESET
+            ):
+                self.root.after(
+                    0,
+                    lambda: self.set_send_status("Send failed: Failed to connect to server", is_error=True)
+                )
+            else:
+                self.root.after(
+                    0,
+                    lambda: self.set_send_status("Send failed: Unexpected error", is_error=True)
+                )
+
         except Exception as e:
-            self.root.after(0, lambda: self.set_send_status(f"Send failed: {e}", is_error=True))
+            self.root.after(
+                    0,
+                    lambda: self.set_send_status("Send failed: Unexpected error", is_error=True)
+                )
 
     def clear_send_fields(self):
         self.send_to.delete(0, tk.END)
@@ -487,10 +523,6 @@ class MailClientGUI:
         self.set_send_status("", is_error=False)
 
 def attempt_login(username, password):
-    """
-    Pokušaj login-a. Za probleme s konekcijom vraća čistu poruku
-    'Login error: Cant connect to server' umjesto sirovog WinError/OS poruke.
-    """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.settimeout(5)
@@ -510,16 +542,22 @@ def attempt_login(username, password):
                 return True, data.get('session')
             else:
                 return False, data.get('error', 'auth failed')
+            
     except (socket.timeout, ConnectionRefusedError, socket.gaierror):
-        return False, "Login error: Cant connect to server"
+        return False, "Cant connect to server"
+    
     except OSError as e:
         if getattr(e, 'errno', None) in (
-            errno.ECONNREFUSED, errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ECONNRESET
+            errno.ECONNREFUSED,
+            errno.ENETUNREACH,
+            errno.EHOSTUNREACH,
+            errno.ECONNRESET
         ):
             return False, "Login error: Cant connect to server"
         return False, "Login error: Unable to login"
+    
     except Exception as e:
-        print("Unexpected login error:", repr(e))
+        #print("Unexpected login error:", repr(e))
         return False, "Login error: Unable to login"
     
 class LoginDialog(tk.Toplevel):
@@ -531,22 +569,12 @@ class LoginDialog(tk.Toplevel):
         self.title("Login")
         self.resizable(False, False)
 
-        self._logging = False
-        self._login_response = None
-
-        try:
-            if getattr(self.parent, 'winfo_ismapped', None) and self.parent.winfo_ismapped():
-                self.transient(self.parent)
-        except Exception:
-            pass
+        self.logging_in = False
+        self.login_response = None
 
         self.deiconify()
         self.lift()
-        try:
-            self.attributes("-topmost", True)
-            self.after(100, lambda: self.attributes("-topmost", False))
-        except Exception:
-            pass
+        self.attributes("-topmost", True)
 
         frm = ttk.Frame(self, padding=12)
         frm.pack(fill='both', expand=True)
@@ -569,13 +597,10 @@ class LoginDialog(tk.Toplevel):
         self.status_label = ttk.Label(frm, text="", anchor='w')
         self.status_label.grid(row=4, column=0, columnspan=2, sticky='we', pady=(8,0))
 
-        self.bind("<Return>", lambda e: self.on_ok())
-        self.bind("<Escape>", lambda e: self.on_cancel())
+        self.bind("<Return>", lambda: self.on_ok())
+        self.bind("<Escape>", lambda: self.on_cancel())
 
-        try:
-            self.grab_set()
-        except Exception:
-            pass
+        self.grab_set()
 
         self.ent_user.focus_set()
         self.update_idletasks()
@@ -585,33 +610,16 @@ class LoginDialog(tk.Toplevel):
         self.update_idletasks()
         w = self.winfo_width()
         h = self.winfo_height()
-        try:
-            if getattr(self.parent, 'winfo_ismapped', None) and self.parent.winfo_ismapped():
-                pw = self.parent.winfo_width()
-                ph = self.parent.winfo_height()
-                px = self.parent.winfo_rootx()
-                py = self.parent.winfo_rooty()
-                x = px + max(0, (pw - w) // 2)
-                y = py + max(0, (ph - h) // 2)
-            else:
-                sw = self.winfo_screenwidth()
-                sh = self.winfo_screenheight()
-                x = max(0, (sw - w) // 2)
-                y = max(0, (sh - h) // 2)
-            self.geometry(f"+{x}+{y}")
-            self.deiconify()
-            self.lift()
-        except Exception:
-            sw = self.winfo_screenwidth()
-            sh = self.winfo_screenheight()
-            x = max(0, (sw - w) // 2)
-            y = max(0, (sh - h) // 2)
-            self.geometry(f"+{x}+{y}")
-            self.deiconify()
-            self.lift()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2)
+        self.geometry(f"+{x}+{y}")
+        self.deiconify()
+        self.lift()
 
     def on_ok(self):
-        if self._logging:
+        if self.logging_in:
             return
         username = self.ent_user.get()
         password = self.ent_pwd.get()
@@ -619,94 +627,60 @@ class LoginDialog(tk.Toplevel):
             self.set_status("Please enter username and password")
             return
 
-        self._set_controls_state('disabled')
-        self._logging = True
+        self.set_controls_state('disabled')
+        self.logging_in = True
         self.set_status("Logging in...")
 
-        self._login_response = None
+        self.login_response = None
 
-        threading.Thread(target=self._login_worker, args=(username, password), daemon=True).start()
+        threading.Thread(target=self.login_thread, args=(username, password), daemon=True).start()
 
-        self.after(100, self._poll_login_response)
+        self.after(100, self.check_login_response)
 
     def on_cancel(self):
-        if self._logging:
+        if self.logging_in:
             return
         self.result = None
-        try:
-            self.grab_release()
-        except Exception:
-            pass
+        self.grab_release()
         self.destroy()
 
-    def _login_worker(self, username, password):
+    def login_thread(self, username, password):
         try:
             ok, result = attempt_login(username, password)
-        except Exception as e:
-            ok, result = False, str(e)
-        self._login_response = (ok, result, username)
+        except Exception:
+            ok, result = False, "Unexpected error"
+        self.login_response = (ok, result, username)
 
-    def _poll_login_response(self):
-        """
-        Called on the main thread via after(): checks whether worker filled
-        self._login_response. If not, schedule another check.
-        """
+    def check_login_response(self):
         if not getattr(self, 'winfo_exists', lambda: True)():
             return
 
-        if self._login_response is None:
-            self.after(100, self._poll_login_response)
+        if self.login_response is None:
+            self.after(100, self.check_login_response)
             return
 
-        ok, result, username = self._login_response
-        self._login_response = None
-        self._logging = False
+        ok, result, username = self.login_response
+        self.login_response = None
+        self.logging_in = False
 
         if ok:
             self.result = (username, result)
-            try:
-                self.grab_release()
-            except Exception:
-                pass
+            self.grab_release()
             self.destroy()
             return
         else:
             self.set_status(f"Login failed: {result}", is_error=True)
-            self._set_controls_state('normal')
+            self.set_controls_state('normal')
             self.ent_pwd.focus_set()
 
-    def _set_controls_state(self, state):
-        try:
-            if state == 'disabled':
-                try:
-                    self.ok_btn.state(['disabled'])
-                except Exception:
-                    self.ok_btn.config(state='disabled')
-                try:
-                    self.cancel_btn.state(['disabled'])
-                except Exception:
-                    self.cancel_btn.config(state='disabled')
-                try:
-                    self.ent_user.config(state='disabled')
-                    self.ent_pwd.config(state='disabled')
-                except Exception:
-                    pass
-            else:
-                try:
-                    self.ok_btn.state(['!disabled'])
-                except Exception:
-                    self.ok_btn.config(state='normal')
-                try:
-                    self.cancel_btn.state(['!disabled'])
-                except Exception:
-                    self.cancel_btn.config(state='normal')
-                try:
-                    self.ent_user.config(state='normal')
-                    self.ent_pwd.config(state='normal')
-                except Exception:
-                    pass
-        except Exception:
-            pass
+    def set_controls_state(self, state):
+        btn_state = ['disabled'] if state == 'disabled' else ['!disabled']
+        entry_state = state
+
+        self.ok_btn.state(btn_state)
+        self.cancel_btn.state(btn_state)
+        self.ent_user.config(state=entry_state)
+        self.ent_pwd.config(state=entry_state)
 
     def set_status(self, text, is_error=False):
         try:
@@ -716,7 +690,6 @@ class LoginDialog(tk.Toplevel):
                 self.status_label.config(text=text, foreground='black')
         except Exception:
             pass
-
 
 def main():
     root = tk.Tk()
