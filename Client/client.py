@@ -283,6 +283,9 @@ class MailClientGUI:
         self.selected_ids.clear()
 
     def fetch_mail(self):
+        self.status_label.config(text="")
+        self.status_label.pack_forget()
+
         self.show_loader()
         threading.Thread(target=self.fetch_mail_thread, daemon=True).start()
 
@@ -470,9 +473,9 @@ class MailClientGUI:
                     }
                 }
                 bytes_to_send = json.dumps(payload).encode()
-                print("A")
+                
                 aesgcm_encrypt_send(aesgcm, sock, bytes_to_send)
-                print("B")
+                
                 
                 plain = aesgcm_recv_decrypt(aesgcm, sock)
                 if plain is None:
